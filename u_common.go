@@ -191,7 +191,17 @@ type ClientHelloSpec struct {
 	TLSVersMax uint16 // [1.2-1.3] default: parse from .Extensions, if SupportedVersions ext is not present => 1.2
 
 	// GreaseStyle: currently only random
-	// sessionID may or may not depend on ticket; nil => random
+	//
+	// GetSessionID declares how ClientHello.session_id is produced:
+	//   - nil: the session_id is 32 random bytes drawn from Config.Rand.
+	//   - non-nil: the session_id is GetSessionID(ticket) when a session ticket
+	//     is being resumed, so that it is stable across ClientHello builds for
+	//     the same ticket (the "depends on ticket" strategy). When no ticket is
+	//     available, it falls back to 32 random bytes.
+	//
+	// QUIC connections always send a zero-length session_id (RFC 9001, Section
+	// 8.4) and ignore this field. The policy is evaluated when the ClientHello is
+	// serialized, after any session has been loaded, so it sees the final ticket.
 	GetSessionID func(ticket []byte) [32]byte
 
 	// TLSFingerprintLink string // ?? link to tlsfingerprint.io for informational purposes

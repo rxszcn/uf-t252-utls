@@ -3088,6 +3088,11 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	var err error
 	p = p.clone()
 
+	// Carry the spec's session_id policy onto the connection. The policy is applied
+	// while the ClientHello is serialized (see UConn.applySessionIDPolicy), because
+	// the ticket it may derive from is only known after the session is loaded.
+	uconn.getSessionID = p.GetSessionID
+
 	err = uconn.SetTLSVers(p.TLSVersMin, p.TLSVersMax, p.Extensions)
 	if err != nil {
 		return err

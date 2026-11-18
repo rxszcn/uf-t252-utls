@@ -36,6 +36,13 @@ type UConn struct {
 	clientHelloBuildStatus ClientHelloBuildStatus
 	clientHelloSpec        *ClientHelloSpec
 
+	// getSessionID is the session_id derivation strategy declared by the applied
+	// ClientHelloSpec (see ClientHelloSpec.GetSessionID). Nil means the session_id
+	// is drawn at random, which is also the behavior for specs that do not declare
+	// the field. It is copied from the spec when the preset is applied and is not
+	// otherwise modified, so rebuilding the ClientHello keeps the same policy.
+	getSessionID func(ticket []byte) [32]byte
+
 	HandshakeState PubClientHandshakeState
 
 	greaseSeed [ssl_grease_seed_count]uint16
@@ -553,7 +560,91 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 
 }
 
+// applySessionIDPolicy computes the ClientHello session_id according to the
+// policy declared by the applied ClientHelloSpec.GetSessionID.
+//
+// The policy is evaluated here, right before the ClientHello is serialized,
+// rather than while the spec is applied, for two reasons:
+//
+//   - GetSessionID's only input is the session ticket, which the session
+//     controller writes into the handshake state after loadSession() runs
+//     (ApplyPreset happens earlier and cannot see it).
+//   - Later calls to MarshalClientHello (for example after the caller has
+//     loaded a different ticket) must derive from the ticket actually sent, so
+//     the derived value has to track the final ticket.
+//
+// Semantics:
+//   - nil policy (or no policy, which is the case for the records that never
+//     declared the field): random 32-byte session_id, as before.
+//   - non-nil policy with a non-empty ticket: the policy's digest of the ticket.
+//   - non-nil policy without a ticket: random fallback, matching the "nil =>
+//     random" contract, so a declared policy never yields an unkeyed value.
+//   - QUIC: session_id stays zero-length (RFC 9001, Section 8.4); the policy is
+//     not evaluated at all.
+//
+// The random fallback value itself is drawn by ApplyPreset, so a declared policy
+// with no ticket keeps exactly the behavior it had before the policy existed.
+func (uconn *UConn) applySessionIDPolicy() {
+	// QUIC connections must not carry a session_id (RFC 9001, Section 8.4).
+	if uconn.quic != nil {
+		uconn.HandshakeState.Hello.SessionId = nil
+		return
+	}
+
+	if uconn.getSessionID == nil {
+		return // random session_id was already drawn by ApplyPreset
+	}
+
+	ticket := uconn.sessionIDTicket()
+	if len(ticket) == 0 {
+		return // no ticket to derive from: keep the random fallback value
+	}
+
+	sessionID := uconn.getSessionID(ticket)
+	uconn.HandshakeState.Hello.SessionId = sessionID[:]
+}
+
+// sessionIDTicket returns the session ticket the ClientHello being serialized
+// will carry, or nil when it carries none.
+//
+// The ticket lives in different places depending on the resumption mechanism
+// and on how far the build has progressed:
+//
+//   - TLS 1.2 resumption puts it in the session_ticket extension, which the
+//     session controller writes to Hello.SessionTicket before marshaling.
+//   - TLS 1.3 resumption puts it in the pre_shared_key extension's identity
+//     labels. Those are only copied onto Hello.PskIdentities after the
+//     ClientHello is marshaled (uApplyPatch), so at this point they must be read
+//     from the extension itself.
+//   - A caller-overridden PSK extension populates Hello.PskIdentities during
+//     uLoadSession, before marshaling.
+func (uconn *UConn) sessionIDTicket() []byte {
+	if ticket := uconn.HandshakeState.Hello.SessionTicket; len(ticket) > 0 {
+		return ticket
+	}
+	if identities := uconn.HandshakeState.Hello.PskIdentities; len(identities) > 0 {
+		return identities[0].Label
+	}
+
+	// The PSK extension has been initialized from a session that utls loaded,
+	// but its identities are not on the hello yet. Only trust an initialized
+	// session here: an override whose identities are not actually sent must not
+	// key the session_id.
+	if uconn.sessionController == nil || uconn.sessionController.pskExtension == nil {
+		return nil
+	}
+	common := uconn.sessionController.pskExtension.GetPreSharedKeyCommon()
+	if common.Session == nil {
+		return nil
+	}
+	if len(common.Identities) > 0 {
+		return common.Identities[0].Label
+	}
+	return common.Session.ticket
+}
+
 func (uconn *UConn) MarshalClientHello() error {
+	uconn.applySessionIDPolicy()
 	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
 		// Real PSKs must only appear in ClientHelloInner. The custom PSK
 		// controller patches binders in the outer hello, so reject this
